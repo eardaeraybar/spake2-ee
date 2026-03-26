@@ -1,133 +1,233 @@
-# SPAKE2+EE
+# SPAKE2+EE for libsodium
 
-A SPAKE2+EE (SPAKE2+ Elligator Edition) implementation for libsodium 1.0.17+
+`spake2-ee` is a compact C implementation of SPAKE2+EE, a password-authenticated key exchange built on top of libsodium's Ed25519 primitives and Elligator-style public-key masking.
 
-## Blurb
+This code is a good fit for projects that need:
 
-SPAKE2 is a password-authenticated key agreement protocol, allowing two parties
-that share a password to securely authenticate each other and derive ephemeral
-session keys. It is secure and computationally efficient.
+- A low-level C PAKE implementation with a small API surface
+- Password-based mutual authentication
+- Two derived session keys, one for each direction
+- An obfuscated elliptic-curve handshake shape suitable for stealth-oriented transports
 
-This is an implementation of the
-[SPAKE2+EE](https://moderncrypto.org/mail-archive/curves/2015/000424.html)
-variant. It's slightly faster than the original SPAKE2 and has better security
-assumptions. It is also augmented, meaning that even if the credentials stored
-on the server ever get leaked, this would not be sufficient to log in.
+## What This Project Does
 
-## Usage
+SPAKE2+EE lets a client and a server that share a password:
 
-The SPAKE2 protocol only requires one round trip to derive shared keys, and
-another round trip for mutual authentication.
+- Derive matching session keys
+- Mutually authenticate each other
+- Avoid storing the raw password on the server
+
+The server stores a derived credential blob. During login, the client and server exchange three short protocol messages:
+
+1. `response1`: client to server
+2. `response2`: server to client
+3. `response3`: client to server
+
+After a successful exchange:
+
+- `client_sk` is intended for client-bound traffic
+- `server_sk` is intended for server-bound traffic
+
+## Current Quality Focus
+
+This workspace version was refactored with performance and robustness as top priorities. The implementation now includes:
+
+- Centralized parsing and serialization for stored/public protocol data
+- Explicit validation of incoming curve points before use
+- Cleaner failure paths with sensitive-memory cleanup
+- Expanded deterministic, tamper, and randomized test coverage
+- Human-readable test vector and telemetry reporting
+
+## Repository Layout
+
+- `src/crypto_spake.c`: protocol implementation
+- `src/crypto_spake.h`: public API
+- `test/test.c`: deterministic vectors, randomized telemetry, and tamper tests
+- `../libsodium`: bundled libsodium source tree used by this workspace
+
+## Public API
+
+The main API is intentionally small:
+
+- `crypto_spake_server_store()`: derive and serialize the server-side stored credential
+- `crypto_spake_step0()`: extract the public password-hash parameters sent to the client
+- `crypto_spake_step1()`: client creates the first SPAKE2+EE message
+- `crypto_spake_step2()`: server processes `response1` and sends `response2`
+- `crypto_spake_step3()`: client validates the server and sends `response3`
+- `crypto_spake_step4()`: server validates the client and releases the final keys
+- `crypto_spake_validate_public_data()`: verify expected KDF settings
+- `crypto_spake_step0_dummy()`: generate deterministic dummy public data for account enumeration resistance
+
+## Usage Example
+
+The example below shows a complete client/server flow using a shared password.
 
 ```c
-    /* A client identifier (username, email address, public key...) */
-    #define CLIENT_ID "client"
+#include <assert.h>
+#include <sodium.h>
+#include <string.h>
 
-    /* A server identifier (IP address, host name, public key...) */
-    #define SERVER_ID "server"
+#include "crypto_spake.h"
 
+#define CLIENT_ID "client"
+#define SERVER_ID "server"
 
-    /*
-     * Computes a blob to be stored by the server, using the default
-     * libsodium password hashing function (currently Argon2id) and
-     * parameters. This operation can also be performed by the
-     * client, with the result eventually sent to the server over a
-     * secure channel.
-     */
+int
+main(void)
+{
+    unsigned char             stored_data[crypto_spake_STOREDBYTES];
+    unsigned char             public_data[crypto_spake_PUBLICDATABYTES];
+    unsigned char             response1[crypto_spake_RESPONSE1BYTES];
+    unsigned char             response2[crypto_spake_RESPONSE2BYTES];
+    unsigned char             response3[crypto_spake_RESPONSE3BYTES];
+    crypto_spake_client_state client_st;
+    crypto_spake_server_state server_st;
+    crypto_spake_shared_keys  shared_keys_from_client;
+    crypto_spake_shared_keys  shared_keys_from_server;
+    int                       ret;
 
-    unsigned char stored_data[crypto_spake_STOREDBYTES];
+    if (sodium_init() < 0) {
+        return 1;
+    }
 
     ret = crypto_spake_server_store(stored_data, "password", 8,
                                     crypto_pwhash_OPSLIMIT_INTERACTIVE,
                                     crypto_pwhash_MEMLIMIT_INTERACTIVE);
     assert(ret == 0);
 
-
-    /*
-     * `public data` is a subset of the data stored on the server.
-     * It only contains the parameters of the password hashing function.
-     */
-
-    unsigned char             public_data[crypto_spake_PUBLICDATABYTES];
-    crypto_spake_server_state server_st;
-
     ret = crypto_spake_step0(&server_st, public_data, stored_data);
     assert(ret == 0);
 
-
-    /*
-     * [CLIENT SIDE]
-     * Computes a packet `response1` using `public_data` and the password.
-     * This first packet has to be sent to the server.
-     */
-
-    unsigned char             response1[crypto_spake_RESPONSE1BYTES];
-    crypto_spake_client_state client_st;
+    ret = crypto_spake_validate_public_data(
+        public_data, crypto_pwhash_alg_default(),
+        crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE);
+    assert(ret == 0);
 
     ret = crypto_spake_step1(&client_st, response1, public_data, "password", 8);
     assert(ret == 0);
-
-
-    /*
-     * [SERVER SIDE]
-     * Processes `response1` received from the client.
-     * Returns `response2` to be sent to the client.
-     */
-
-    unsigned char            response2[crypto_spake_RESPONSE2BYTES];
-    crypto_spake_shared_keys shared_keys_from_client;
 
     ret = crypto_spake_step2(&server_st, response2, CLIENT_ID,
                              sizeof CLIENT_ID - 1, SERVER_ID,
                              sizeof SERVER_ID - 1, stored_data, response1);
     assert(ret == 0);
 
-
-    /*
-     * [CLIENT SIDE]
-     * Processes `response2` received from the server.
-     * Returns a set of shared keys in `shared_keys_from_server`,
-     * as well as `response3` to be sent to the server for validation.
-     */
-
-    unsigned char            response3[crypto_spake_RESPONSE3BYTES];
-    crypto_spake_shared_keys shared_keys_from_server;
-
     ret = crypto_spake_step3(&client_st, response3, &shared_keys_from_server,
                              CLIENT_ID, sizeof CLIENT_ID - 1, SERVER_ID,
                              sizeof SERVER_ID - 1, response2);
     assert(ret == 0);
 
-
-    /*
-     * [SERVER SIDE]
-     * Processes `response3` received from the client.
-     * After validation, returns a set of shared key (identical to the one
-     * computed by the client) in `shared_keys_from_client`.
-     */
-
     ret = crypto_spake_step4(&server_st, &shared_keys_from_client, response3);
     assert(ret == 0);
 
-
-    /*
-     * Both parties now share two session keys.
-     * The first one can be used for server->client communications,
-     * and the second one can be used in the other direction.
-     */
-
     assert(memcmp(&shared_keys_from_client, &shared_keys_from_server,
                   sizeof shared_keys_from_client) == 0);
+
+    return 0;
+}
 ```
 
-## Caveats
+## Protocol Flow
 
-The documentation is terrible.
+### Server setup
 
-The API could be way better.
+The server derives `stored_data` once from the user's password:
 
-The implementation could be faster by using private functions.
+```c
+crypto_spake_server_store(stored_data, password, password_len,
+                          crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                          crypto_pwhash_MEMLIMIT_INTERACTIVE);
+```
 
-A version using libhydrogen would make more sense.
+This blob contains:
 
-But my Starbucks card balance is zero, so this is all you get for now.
+- Password hashing parameters
+- Salt
+- Derived SPAKE2+EE server data
+
+### Login flow
+
+At authentication time:
+
+1. The server calls `crypto_spake_step0()` to send `public_data`
+2. The client calls `crypto_spake_step1()` and sends `response1`
+3. The server calls `crypto_spake_step2()` and sends `response2`
+4. The client calls `crypto_spake_step3()` and sends `response3`
+5. The server calls `crypto_spake_step4()` and releases the final shared keys
+
+## Security Notes
+
+- Always call `sodium_init()` before using the API.
+- Use authenticated transport framing around the protocol messages if your application layer needs message typing, replay handling, or channel binding.
+- Treat `stored_data` as sensitive server credential material.
+- Keep `client_id` and `server_id` stable and unambiguous. They are part of key derivation and validation.
+- If `crypto_spake_step3()` or `crypto_spake_step4()` fails, authentication must be treated as failed.
+- The implementation zeroes sensitive state on failure paths, but your application should still avoid logging protocol secrets or raw buffers.
+
+## Running The Tests
+
+The test harness in `test/test.c` covers:
+
+- Baseline success
+- Wrong-password rejection
+- Tampered public data
+- Tampered `response1`
+- Tampered `response2`
+- Tampered `response3`
+- Corrupted stored server data
+- Deterministic dummy public data
+- Deterministic human-readable vectors
+- Randomized telemetry with generated passwords and identities
+
+In this workspace, the test binary was built directly against the bundled libsodium sources.
+
+### Example compile command used in this workspace
+
+```sh
+find ../libsodium/src/libsodium -name '*.c' | sort > /tmp/libsodium_sources.txt
+
+cc -O2 -std=c99 -Wall -Wextra -Wno-unused-function \
+  -I../libsodium/src/libsodium/include \
+  -I../libsodium/src/libsodium/include/sodium \
+  -I../libsodium/src/libsodium \
+  -Isrc \
+  -D_GNU_SOURCE=1 -DCONFIGURED=1 -DDEV_MODE=1 \
+  -DHAVE_ATOMIC_OPS=1 -DHAVE_C11_MEMORY_FENCES=1 -DHAVE_CET_H=1 \
+  -DHAVE_GCC_MEMORY_FENCES=1 -DHAVE_INLINE_ASM=1 -DHAVE_INTTYPES_H=1 \
+  -DHAVE_STDINT_H=1 -DHAVE_TI_MODE=1 -DNATIVE_LITTLE_ENDIAN=1 \
+  -DASM_HIDE_SYMBOL=.private_extern -DTLS=_Thread_local \
+  -DHAVE_ARC4RANDOM=1 -DHAVE_ARC4RANDOM_BUF=1 -DHAVE_CATCHABLE_ABRT=1 \
+  -DHAVE_CATCHABLE_SEGV=1 -DHAVE_CLOCK_GETTIME=1 -DHAVE_GETENTROPY=1 \
+  -DHAVE_GETPID=1 -DHAVE_MADVISE=1 -DHAVE_MEMSET_S=1 -DHAVE_MLOCK=1 \
+  -DHAVE_MMAP=1 -DHAVE_MPROTECT=1 -DHAVE_NANOSLEEP=1 \
+  -DHAVE_POSIX_MEMALIGN=1 -DHAVE_PTHREAD=1 \
+  -DHAVE_PTHREAD_PRIO_INHERIT=1 -DHAVE_RAISE=1 -DHAVE_SYSCONF=1 \
+  -DHAVE_SYS_MMAN_H=1 -DHAVE_SYS_PARAM_H=1 -DHAVE_SYS_RANDOM_H=1 \
+  -DHAVE_WEAK_SYMBOLS=1 -DHAVE_ARMCRYPTO=1 \
+  @/tmp/libsodium_sources.txt \
+  src/crypto_spake.c \
+  test/test.c \
+  -o /tmp/spake_test
+```
+
+Then run:
+
+```sh
+/tmp/spake_test
+```
+
+The output is organized into:
+
+- `Validation Summary`
+- `Deterministic Test Vectors`
+- `Randomized Telemetry`
+
+## Compatibility Note
+
+This workspace uses the bundled libsodium tree in `../libsodium`. For compatibility with that source snapshot, the implementation uses the local Ed25519 ref10 Elligator mapping entry point internally.
+
+## Limitations
+
+- This is a low-level C API, not a complete application protocol.
+- It does not define wire framing, retry logic, replay protection, or transport integration.
+- The test harness is strong for correctness and coverage, but it is not a benchmark framework.
+- The current repository layout is source-oriented rather than package-oriented; build system integration may need cleanup for production use.
