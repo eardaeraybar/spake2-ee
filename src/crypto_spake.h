@@ -2,6 +2,8 @@
 #ifndef crypto_spake_H
 #define crypto_spake_H 1
 
+#include <stddef.h>
+
 #define crypto_spake_DUMMYKEYBYTES 32
 #define crypto_spake_PUBLICDATABYTES 36
 #define crypto_spake_RESPONSE1BYTES 32
